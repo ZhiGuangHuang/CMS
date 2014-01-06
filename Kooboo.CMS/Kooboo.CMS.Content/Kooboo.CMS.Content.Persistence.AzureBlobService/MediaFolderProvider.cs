@@ -106,6 +106,36 @@ namespace Kooboo.CMS.Content.Persistence.AzureBlobService
             }
 
         }
+        public static void RenameFolder(MediaFolder @new, MediaFolder old)
+        {
+
+            locker.EnterWriteLock();
+            try
+            {
+                var folders = GetList(old.Repository);
+                var keys = folders.Keys.ToList();
+                foreach (var key in keys)
+                {
+                    if (key.StartsWith(old.FullName + "~"))
+                    {
+                        var newKey = @new.FullName+key.Substring(old.FullName.Length);
+                        folders.Add(newKey, folders[key]);
+                        folders.Remove(key);
+                    }
+                }
+                if (folders.ContainsKey(old.FullName) && !folders.ContainsKey(@new.FullName))
+                {
+                    folders.Add(@new.FullName, @new);
+                    folders.Remove(@old.FullName);
+                    //folders[old.FullName] = folder;
+                    SaveList(@new.Repository, folders);
+                }
+            }
+            finally
+            {
+                locker.ExitWriteLock();
+            }
+        }
 
         public static IEnumerable<MediaFolder> RootFolders(Repository repository)
         {
@@ -125,7 +155,10 @@ namespace Kooboo.CMS.Content.Persistence.AzureBlobService
             locker.EnterReadLock();
             try
             {
-                return ToMediaFolders(parent.Repository, GetList(parent.Repository)).Where(it => it.Parent == parent);
+                var query = ToMediaFolders(parent.Repository, GetList(parent.Repository));
+                //loop bug in azure
+                query = query.Where(it => (parent == null && it.Parent == null) || (it.Parent != null && it.Parent.UUID == parent.UUID));
+                return query;
             }
             finally
             {
@@ -284,13 +317,57 @@ namespace Kooboo.CMS.Content.Persistence.AzureBlobService
 
         public void Rename(MediaFolder @new, MediaFolder old)
         {
-            throw new NotImplementedException();
+            MediaFolders.RenameFolder(@new, old);
+
+            var blobClient = CloudStorageAccountHelper.GetStorageAccount().CreateCloudBlobClient();
+            //var dir = blobContainer.GetDirectoryReference();
+            var oldPrefix = old.GetMediaFolderItemPath(null) + "/";
+            var newPrefix = @new.GetMediaFolderItemPath(null) + "/";
+            MoveDirectory(blobClient, newPrefix, oldPrefix);
         }
 
 
         public void Export(Repository repository, string baseFolder, string[] folders, string[] docs, Stream outputStream)
         {
             throw new NotImplementedException();
+        }
+
+
+        private void MoveDirectory(CloudBlobClient blobClient, string newPrefix, string oldPrefix)
+        {
+            var blobs = blobClient.ListBlobsWithPrefix(oldPrefix, 
+                new BlobRequestOptions() { BlobListingDetails = Microsoft.WindowsAzure.StorageClient.BlobListingDetails.Metadata, UseFlatBlobListing = false });
+            foreach (var blob in blobs)
+            {
+                if (blob is CloudBlobDirectory)
+                {
+                    var dir = blob as CloudBlobDirectory;
+
+                    var names = dir.Uri.ToString().Split('/');
+                    for (var i = names.Length - 1; i >= 0; i--)
+                    {
+                        if (!string.IsNullOrEmpty(names[i]))
+                        {
+                            MoveDirectory(blobClient, newPrefix + names[i] + "/", oldPrefix + names[i] + "/");
+                            break;
+                        }
+                    }
+                }
+                else if (blob is CloudBlob)
+                {
+                    var cloudBlob = blob as CloudBlob;
+
+                    if (cloudBlob.Exists())
+                    {
+                        cloudBlob.FetchAttributes();
+                        var newContentBlob = blobClient.GetBlockBlobReference(newPrefix + cloudBlob.Metadata["FileName"]);
+                        newContentBlob.CopyFromBlob(cloudBlob);
+                        newContentBlob.Metadata["FileName"] = cloudBlob.Metadata["FileName"];
+                        newContentBlob.SetMetadata();
+                        cloudBlob.DeleteIfExists();
+                    }
+                }
+            }
         }
     }
 }
